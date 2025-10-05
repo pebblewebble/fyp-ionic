@@ -1,22 +1,88 @@
-import { IonContent, IonHeader, IonPage, IonTitle, IonToolbar } from '@ionic/react';
-import ExploreContainer from '../components/ExploreContainer';
+import { IonPage, IonHeader, IonToolbar, IonTitle, IonContent, IonButton, IonList, IonItem, IonLabel } from '@ionic/react';
+import { useRingDataCollector } from '../services/RingDataService';
 import './Home.css';
+import { useEffect } from 'react';
 
 const Home: React.FC = () => {
+  const { 
+    initialize, 
+    scanAndConnect, 
+    startDataCollection, 
+    stopDataCollection, 
+    isCollecting, 
+    data, 
+    error,
+    deviceId  // Add this to destructuring
+  } = useRingDataCollector();
+
+  // Initialize on mount
+  useEffect(() => {
+    initialize();
+  }, [initialize]);
+
   return (
     <IonPage>
       <IonHeader>
         <IonToolbar>
-          <IonTitle>Blank</IonTitle>
+          <IonTitle>Ring Data Collector</IonTitle>
         </IonToolbar>
       </IonHeader>
-      <IonContent fullscreen>
-        <IonHeader collapse="condense">
-          <IonToolbar>
-            <IonTitle size="large">Blank</IonTitle>
-          </IonToolbar>
-        </IonHeader>
-        <ExploreContainer />
+      <IonContent className="ion-padding">
+        <IonButton 
+          onClick={scanAndConnect} 
+          disabled={!!deviceId}
+          expand="block"
+        >
+          {deviceId ? 'Connected' : 'Scan and Connect'}
+        </IonButton>
+        
+        <IonButton 
+          onClick={() => startDataCollection(60, 'walking')} 
+          disabled={!deviceId || isCollecting}
+          expand="block"
+        >
+          Start Collection (60s)
+        </IonButton>
+        
+        <IonButton 
+          onClick={stopDataCollection} 
+          disabled={!isCollecting}
+          expand="block"
+          color="danger"
+        >
+          Stop Collection
+        </IonButton>
+
+        {error && (
+          <IonItem color="danger">
+            <IonLabel>Error: {error}</IonLabel>
+          </IonItem>
+        )}
+
+        <IonItem>
+          <IonLabel>
+            <h2>Status</h2>
+            <p>Device: {deviceId || 'Not connected'}</p>
+            <p>Collecting: {isCollecting ? 'Yes' : 'No'}</p>
+            <p>Data points: {data.length}</p>
+          </IonLabel>
+        </IonItem>
+
+        <IonList>
+          <IonItem>
+            <IonLabel><h2>Collected Data</h2></IonLabel>
+          </IonItem>
+          {data.slice(-10).reverse().map((entry, index) => (
+            <IonItem key={index}>
+              <IonLabel>
+                <h3>Label: {entry.label}</h3>
+                <p>Time: {new Date(entry.timestamp).toLocaleTimeString()}</p>
+                <p>HR: {entry.hr || 'N/A'} | AccX: {entry.accX?.toFixed(2) || 'N/A'} | AccY: {entry.accY?.toFixed(2) || 'N/A'} | AccZ: {entry.accZ?.toFixed(2) || 'N/A'}</p>
+                <p>PPG: {entry.ppg || 'N/A'} | SpO2: {entry.spo2 || 'N/A'}%</p>
+              </IonLabel>
+            </IonItem>
+          ))}
+        </IonList>
       </IonContent>
     </IonPage>
   );
