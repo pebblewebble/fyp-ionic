@@ -1,0 +1,7 @@
+{
+  "name": "fyp-ionic",
+  "integrations": {
+    "capacitor": {}
+  },
+  "type": "react-vite"
+}
