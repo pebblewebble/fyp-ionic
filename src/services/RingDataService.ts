@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect } from 'react';
-import { BluetoothLe } from '@capacitor-community/bluetooth-le';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { BluetoothLe, BleClient } from '@capacitor-community/bluetooth-le';
 import Papa from 'papaparse';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 
@@ -12,11 +12,6 @@ const RXTX_NOTIFY_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const MAIN_SERVICE_UUID = 'de5bf728-d711-4e47-af26-65e3012a5dc7';
 const MAIN_NOTIFY_UUID = 'de5bf729-d711-4e47-af26-65e3012a5dc7';
 
-const toBase64 = (bytes: Uint8Array): string => {
-  let binary = '';
-  bytes.forEach(b => binary += String.fromCharCode(b));
-  return btoa(binary);
-};
 // Command creation function (port from ring.py)
 const createCommand = (hexString: string): Uint8Array => {
   const bytesArray: number[] = [];
@@ -28,7 +23,7 @@ const createCommand = (hexString: string): Uint8Array => {
     bytesArray.push(0);
   }
   // Add checksum
-  const checksum = bytesArray.reduce((sum, byte) => sum + byte, 0) & 0xFF;
+  const checksum = bytesArray.reduce((sum, byte) => sum + byte, 0) & 0xff;
   bytesArray.push(checksum);
   return new Uint8Array(bytesArray);
 };
@@ -39,17 +34,99 @@ const SET_UNITS_METRICS = createCommand('0a0200');
 const ENABLE_RAW_SENSOR_CMD = createCommand('a104');
 const DISABLE_RAW_SENSOR_CMD = createCommand('a102');
 
+// --- Helpers for conversions and debugging ---
+const toBase64 = (bytes: Uint8Array): string => {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return typeof btoa !== 'undefined' ? btoa(binary) : Buffer.from(binary, 'binary').toString('base64');
+};
+
+const bytesToHex = (bytes: Uint8Array): string => {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const dumpServices = async (deviceId: string) => {
+  try {
+    if ((BleClient as any)?.getServices) {
+      const svc = await (BleClient as any).getServices(deviceId);
+      console.log('BleClient.getServices result:', svc);
+      return svc;
+    } else if ((BluetoothLe as any)?.getServices) {
+      // Some versions expose getServices on BluetoothLe
+      const svc = await (BluetoothLe as any).getServices({ deviceId });
+      console.log('BluetoothLe.getServices result:', svc);
+      return svc;
+    } else {
+      console.warn('No getServices API detected in plugin; skip dump.');
+      return null;
+    }
+  } catch (e) {
+    console.error('Failed to dump services:', e);
+    return null;
+  }
+};
+
+const writeCommand = async (
+  deviceId: string,
+  service: string,
+  characteristic: string,
+  bytes: Uint8Array
+) => {
+  // Try BleClient.write (takes DataView) -> then hex string -> then base64 string
+  try {
+    if ((BleClient as any)?.write) {
+      await (BleClient as any).write(deviceId, service, characteristic, new DataView(bytes.buffer));
+      return;
+    }
+  } catch (e) {
+    console.warn('BleClient.write failed, will fallback to plugin write:', e);
+  }
+
+  // Fallback: try hex string (this matches Android plugin hex parser)
+  try {
+    await BluetoothLe.write({
+      deviceId,
+      service,
+      characteristic,
+      value: bytesToHex(bytes),
+    } as any);
+    return;
+  } catch (e) {
+    console.warn('BluetoothLe.write with hex failed, will try base64 fallback:', e);
+  }
+
+  // Last resort: try base64 encoding (some platforms expect base64)
+  try {
+    await BluetoothLe.write({
+      deviceId,
+      service,
+      characteristic,
+      value: toBase64(bytes),
+    } as any);
+    return;
+  } catch (e) {
+    console.error('All write attempts failed:', e);
+    throw e;
+  }
+};
+
 export const useRingDataCollector = () => {
   const [deviceId, setDeviceId] = useState<string | null>(null);
-  const [data, setData] = useState<any[]>([]); // { timestamp, payload, accX, accY, accZ, ppg, ppg_max, ppg_min, ppg_diff, spo2, spo2_max, spo2_min, spo2_diff, label }
+  const [data, setData] = useState<any[]>([]);
   const [isCollecting, setIsCollecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Keep listener handles so we can remove them on stop/unmount
+  const rxtxListenerRef = useRef<any>(null);
+  const mainListenerRef = useRef<any>(null);
 
   const initialize = useCallback(async () => {
     try {
       await BluetoothLe.initialize({ androidNeverForLocation: true });
     } catch (err) {
-      setError(`Initialization error: ${err}`);
+      setError(`Initialization error: ${String(err)}`);
     }
   }, []);
 
@@ -57,62 +134,52 @@ export const useRingDataCollector = () => {
     try {
       console.log('Starting manual scan...');
       setError(null);
-      
-      // Step 1: Check Bluetooth is enabled
+
       const isEnabled = await BluetoothLe.isEnabled();
       console.log('Bluetooth enabled:', isEnabled);
-      
       if (!isEnabled) {
         await BluetoothLe.enable();
       }
-      
-      // Step 2: Set up scan listener BEFORE starting scan
+
       const scanResults: any[] = [];
-      
-      await BluetoothLe.addListener('onScanResult', (result) => {
+      await BluetoothLe.addListener('onScanResult', (result: any) => {
         console.log('Found device:', result.device);
         scanResults.push(result.device);
-        
-        // If we find the ring, we can stop scanning immediately
-        if (result.device.name?.includes('R06')) {
-          console.log('Found R06 ring!');
-        }
       });
-      
-      // Step 3: Start scanning manually
-      await BluetoothLe.requestLEScan({
-        allowDuplicates: false,
-        scanMode: 2, // Low latency
-      });
-      
+
+      await BluetoothLe.requestLEScan({ allowDuplicates: false, scanMode: 2 });
       console.log('Scanning for 10 seconds...');
-      
-      // Step 4: Wait for scan results
-      await new Promise(resolve => setTimeout(resolve, 10000));
-      
-      // Step 5: Stop scan
+      await new Promise((resolve) => setTimeout(resolve, 10000));
       await BluetoothLe.stopLEScan();
       console.log('Scan stopped. Found devices:', scanResults);
-      
-      // Step 6: Find and connect to ring
-      const ring = scanResults.find(d => d.name?.includes('R06'));
-      
-      if (!ring) {
-        throw new Error(`No R06 ring found. Found ${scanResults.length} devices total`);
-      }
-      
+
+      const ring = scanResults.find((d) => d.name?.includes('R06'));
+      if (!ring) throw new Error(`No R06 ring found. Found ${scanResults.length} devices total`);
+
       console.log('Connecting to:', ring.name, ring.deviceId);
-      setDeviceId(ring.deviceId);
-      
-      await BluetoothLe.connect({ 
+      // Make sure scanning fully stopped before connecting
+      try { await BluetoothLe.stopLEScan(); } catch (e) { /* ignore if already stopped */ }
+      await new Promise(resolve => setTimeout(resolve, 200)); // short pause
+
+      // Attempt connect (increase timeout here)
+      await BluetoothLe.connect({
         deviceId: ring.deviceId,
-        timeout: 10000
+        timeout: 20000, // 20s
       });
-      
+
+      BluetoothLe.addListener('onDisconnect', (info: any) => {
+        if (info?.deviceId === ring.deviceId) {
+          console.log('Device disconnected:', info.deviceId);
+          setIsCollecting(false);
+          setDeviceId(null);
+        }
+      });
+
+      // only now mark device as connected in state
+      setDeviceId(ring.deviceId);
       console.log('Connected successfully!');
-      
     } catch (err: any) {
-      const errorMsg = `Error: ${err?.message || err}`;
+      const errorMsg = `Error: ${err?.message || String(err)}`;
       setError(errorMsg);
       console.error('Full error:', err);
     }
@@ -121,43 +188,51 @@ export const useRingDataCollector = () => {
   const handleNotification = (value: DataView, label: string) => {
     const bytes = new Uint8Array(value.buffer);
     const timestamp = Date.now();
-    const newEntry: any = { 
-      timestamp, 
-      label, 
-      payload: Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(''),
-      accX: '', accY: '', accZ: '',
-      ppg: '', ppg_max: '', ppg_min: '', ppg_diff: '',
-      spo2: '', spo2_max: '', spo2_min: '', spo2_diff: ''
+    const newEntry: any = {
+      timestamp,
+      label,
+      payload: Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join(''),
+      accX: '',
+      accY: '',
+      accZ: '',
+      ppg: '',
+      ppg_max: '',
+      ppg_min: '',
+      ppg_diff: '',
+      spo2: '',
+      spo2_max: '',
+      spo2_min: '',
+      spo2_diff: '',
     };
 
-    // Port parsing from ring.py's handle_notification
-    if (bytes[0] === 0xA1) {
+    if (bytes[0] === 0xa1) {
       const subtype = bytes[1];
-      if (subtype === 0x01) { // SpO2
+      if (subtype === 0x01) {
         newEntry.spo2 = (bytes[2] << 8) | bytes[3];
         newEntry.spo2_max = bytes[5];
         newEntry.spo2_min = bytes[7];
         newEntry.spo2_diff = bytes[9];
-      } else if (subtype === 0x02) { // PPG
+      } else if (subtype === 0x02) {
         newEntry.ppg = (bytes[2] << 8) | bytes[3];
         newEntry.ppg_max = (bytes[4] << 8) | bytes[5];
         newEntry.ppg_min = (bytes[6] << 8) | bytes[7];
         newEntry.ppg_diff = (bytes[8] << 8) | bytes[9];
-      } else if (subtype === 0x03) { // Accel
-        let valX = ((bytes[6] << 4) | (bytes[7] & 0x0F));
+      } else if (subtype === 0x03) {
+        let valX = ((bytes[6] << 4) | (bytes[7] & 0x0f));
         if (valX & 0x0800) valX -= 0x1000;
         newEntry.accX = valX;
 
-        let valY = ((bytes[2] << 4) | (bytes[3] & 0x0F));
+        let valY = ((bytes[2] << 4) | (bytes[3] & 0x0f));
         if (valY & 0x0800) valY -= 0x1000;
         newEntry.accY = valY;
 
-        let valZ = ((bytes[4] << 4) | (bytes[5] & 0x0F));
+        let valZ = ((bytes[4] << 4) | (bytes[5] & 0x0f));
         if (valZ & 0x0800) valZ -= 0x1000;
         newEntry.accZ = valZ;
       }
 
-      // Optional: Skip if ppg or spo2 is 0 (as in Python, but adjusted for types)
       if (newEntry.ppg === 0 || newEntry.spo2 === 0) {
         console.log('Skipping data with zero ppg or spo2 values');
         return;
@@ -168,145 +243,148 @@ export const useRingDataCollector = () => {
     }
   };
 
-  const startDataCollection = useCallback(async (durationSeconds: number = 60, label: string = 'default') => {
-    if (!deviceId || isCollecting) return;
+  const startDataCollection = useCallback(
+    async (durationSeconds: number = 60, label: string = 'default') => {
+      if (!deviceId || isCollecting) return;
 
-    setIsCollecting(true);
-    setError(null);
-    setData([]); // Reset data
+      setIsCollecting(true);
+      setError(null);
+      setData([]);
 
-    try {
-      // Note: Removed discoverServices as it was timing out. 
-      // Assuming the plugin can access characteristics without explicit discovery after connect.
-      // If issues persist, consider debugging the plugin or device compatibility.
+      try {
+        // small delay after connect to allow discovery to complete on some Android devices
+        await new Promise((resolve) => setTimeout(resolve, 500));
 
-      // Small delay after connect
-      await new Promise(resolve => setTimeout(resolve, 500));
+        // dump services for debugging; inspect console if notifications fail
+        await dumpServices(deviceId);
 
-      // Set up notification listeners BEFORE starting notifications
-      const rxtxListenerKey = `notification|${deviceId}|${RXTX_SERVICE_UUID}|${RXTX_NOTIFY_UUID}`;
-      await BluetoothLe.addListener(
-        rxtxListenerKey,
-        (result) => {
-          if (!result.value) {
-            console.log('Received notification with undefined value');
+        // Set up notification listeners BEFORE starting notifications
+        const rxtxListenerKey = `notification|${deviceId}|${RXTX_SERVICE_UUID}|${RXTX_NOTIFY_UUID}`;
+        rxtxListenerRef.current = await BluetoothLe.addListener(rxtxListenerKey, (result: any) => {
+          if (!result?.value) {
+            console.log('Received notification with undefined value (RXTX)');
             return;
           }
           let dataView: DataView;
           if (typeof result.value === 'string') {
-            const binaryString = atob(result.value);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
+            // plugin might return base64 string or binary string
+            try {
+              const binaryString = atob(result.value);
+              const bytes = new Uint8Array(binaryString.length);
+              for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+              dataView = new DataView(bytes.buffer);
+            } catch (e) {
+              // if atob fails, try hex string
+              const hex = result.value as string;
+              const arr = new Uint8Array(hex.length / 2);
+              for (let i = 0; i < hex.length; i += 2) arr[i / 2] = parseInt(hex.substr(i, 2), 16);
+              dataView = new DataView(arr.buffer);
             }
-            dataView = new DataView(bytes.buffer);
           } else {
-            dataView = result.value;
+            dataView = result.value as DataView;
           }
           handleNotification(dataView, label);
-        }
-      );
+        });
 
-      const mainListenerKey = `notification|${deviceId}|${MAIN_SERVICE_UUID}|${MAIN_NOTIFY_UUID}`;
-      await BluetoothLe.addListener(
-        mainListenerKey,
-        (result) => {
-          if (!result.value) {
-            console.log('Received notification with undefined value');
+        const mainListenerKey = `notification|${deviceId}|${MAIN_SERVICE_UUID}|${MAIN_NOTIFY_UUID}`;
+        mainListenerRef.current = await BluetoothLe.addListener(mainListenerKey, (result: any) => {
+          if (!result?.value) {
+            console.log('Received notification with undefined value (MAIN)');
             return;
           }
           let dataView: DataView;
           if (typeof result.value === 'string') {
-            const binaryString = atob(result.value);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
+            try {
+              const binaryString = atob(result.value);
+              const bytes = new Uint8Array(binaryString.length);
+              for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+              dataView = new DataView(bytes.buffer);
+            } catch (e) {
+              const hex = result.value as string;
+              const arr = new Uint8Array(hex.length / 2);
+              for (let i = 0; i < hex.length; i += 2) arr[i / 2] = parseInt(hex.substr(i, 2), 16);
+              dataView = new DataView(arr.buffer);
             }
-            dataView = new DataView(bytes.buffer);
           } else {
-            dataView = result.value;
+            dataView = result.value as DataView;
           }
           handleNotification(dataView, label);
+        });
+
+        // Start notifications (only after listeners registered)
+        console.log('Starting notifications...');
+        try {
+          await BluetoothLe.startNotifications({ deviceId, service: RXTX_SERVICE_UUID, characteristic: RXTX_NOTIFY_UUID });
+          await BluetoothLe.startNotifications({ deviceId, service: MAIN_SERVICE_UUID, characteristic: MAIN_NOTIFY_UUID });
+          console.log('Notifications started');
+        } catch (e) {
+          console.error('startNotifications error:', e);
+          throw e;
         }
-      );
 
-      // Enable notifications on both services
-      console.log('Starting notifications...');
-      await BluetoothLe.startNotifications({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_NOTIFY_UUID,
-      });
-      await BluetoothLe.startNotifications({
-        deviceId,
-        service: MAIN_SERVICE_UUID,
-        characteristic: MAIN_NOTIFY_UUID,
-      });
-      console.log('Notifications started');
+        // Send commands to RXTX service using helper that tries BleClient then hex then base64
+        console.log('Sending commands...');
+        await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, BATTERY_CMD);
+        await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, SET_UNITS_METRICS);
+        await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, ENABLE_RAW_SENSOR_CMD);
+        console.log('Commands sent');
 
-      // Send commands to RXTX service
-      console.log('Sending commands...');
-      await BluetoothLe.write({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_WRITE_UUID,
-        value: new DataView(BATTERY_CMD.buffer),
-      });
-      await BluetoothLe.write({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_WRITE_UUID,
-        value: new DataView(SET_UNITS_METRICS.buffer),
-      });
-      await BluetoothLe.write({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_WRITE_UUID,
-        value: new DataView(ENABLE_RAW_SENSOR_CMD.buffer),
-      });
-      console.log('Commands sent');
-
-      // Auto-stop after duration
-      setTimeout(() => stopDataCollection(), durationSeconds * 1000);
-    } catch (err) {
-      setError(`Start error: ${err}`);
-      setIsCollecting(false);
-      console.error('Full error:', err);
-    }
-  }, [deviceId, isCollecting]);
+        // Auto-stop after duration
+        setTimeout(() => stopDataCollection(), durationSeconds * 1000);
+      } catch (err) {
+        setError(`Start error: ${String(err)}`);
+        setIsCollecting(false);
+        console.error('Full error:', err);
+      }
+    },
+    [deviceId, isCollecting]
+  );
 
   const stopDataCollection = useCallback(async () => {
     if (!deviceId || !isCollecting) return;
 
     try {
       // Send disable command
-      await BluetoothLe.write({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_WRITE_UUID,
-        value: new DataView(DISABLE_RAW_SENSOR_CMD.buffer),
-      });
+      await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, DISABLE_RAW_SENSOR_CMD);
 
       // Stop notifications
-      await BluetoothLe.stopNotifications({
-        deviceId,
-        service: RXTX_SERVICE_UUID,
-        characteristic: RXTX_NOTIFY_UUID,
-      });
-      await BluetoothLe.stopNotifications({
-        deviceId,
-        service: MAIN_SERVICE_UUID,
-        characteristic: MAIN_NOTIFY_UUID,
-      });
+      try {
+        await BluetoothLe.stopNotifications({ deviceId, service: RXTX_SERVICE_UUID, characteristic: RXTX_NOTIFY_UUID });
+      } catch (e) {
+        console.warn('stopNotifications RXTX failed:', e);
+      }
+      try {
+        await BluetoothLe.stopNotifications({ deviceId, service: MAIN_SERVICE_UUID, characteristic: MAIN_NOTIFY_UUID });
+      } catch (e) {
+        console.warn('stopNotifications MAIN failed:', e);
+      }
+
+      // Remove listeners if present
+      try {
+        if (rxtxListenerRef.current?.remove) await rxtxListenerRef.current.remove();
+      } catch (e) {
+        console.warn('Failed to remove rxtx listener:', e);
+      }
+      try {
+        if (mainListenerRef.current?.remove) await mainListenerRef.current.remove();
+      } catch (e) {
+        console.warn('Failed to remove main listener:', e);
+      }
 
       await saveToCsv();
-      await BluetoothLe.disconnect({ deviceId });
+      try {
+        await BluetoothLe.disconnect({ deviceId });
+      } catch (e) {
+        console.warn('Disconnect failed or already disconnected:', e);
+      }
+
       setDeviceId(null);
       setIsCollecting(false);
       console.log('Stopped and disconnected');
     } catch (err) {
-      setError(`Stop error: ${err}`);
+      setError(`Stop error: ${String(err)}`);
       setIsCollecting(false);
+      console.error('Stop error full:', err);
     }
   }, [deviceId, isCollecting, data]);
 
@@ -315,19 +393,13 @@ export const useRingDataCollector = () => {
     const fileName = `ring_data_${Date.now()}.csv`;
 
     try {
-      await Filesystem.writeFile({
-        path: fileName,
-        data: btoa(csv), // Base64 encode for safety
-        directory: Directory.Documents,
-        encoding: Encoding.UTF8,
-      });
+      await Filesystem.writeFile({ path: fileName, data: typeof btoa !== 'undefined' ? btoa(csv) : Buffer.from(csv).toString('base64'), directory: Directory.Documents, encoding: Encoding.UTF8 });
       console.log('Saved to', fileName);
     } catch (err) {
-      setError(`CSV save error: ${err}`);
+      setError(`CSV save error: ${String(err)}`);
     }
   };
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (deviceId && isCollecting) {
@@ -344,6 +416,6 @@ export const useRingDataCollector = () => {
     isCollecting,
     data,
     error,
-    deviceId
+    deviceId,
   };
 };
