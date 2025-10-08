@@ -79,7 +79,9 @@ const Home: React.FC = () => {
                 <p>Time: {new Date(entry.timestamp).toLocaleTimeString()}</p>
                 <p>HR: {entry.hr || 'N/A'} | AccX: {entry.accX?.toFixed(2) || 'N/A'} | AccY: {entry.accY?.toFixed(2) || 'N/A'} | AccZ: {entry.accZ?.toFixed(2) || 'N/A'}</p>
                 <p>PPG: {entry.ppg || 'N/A'} | SpO2: {entry.spo2 || 'N/A'}%</p>
-                <p>{JSON.stringify(entry,null,2)}</p>
+                <pre style={{ whiteSpace: 'pre-wrap', maxHeight: 300, overflow: 'auto', background:'#111', color:'#fff', padding:8 }}>
+                  {JSON.stringify(data?.slice(-10) ?? [], null, 2)}
+                </pre>
               </IonLabel>
             </IonItem>
           ))}
