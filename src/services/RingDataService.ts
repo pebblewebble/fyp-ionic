@@ -362,6 +362,7 @@ export const useRingDataCollector = () => {
   );
 
   const stopDataCollection = useCallback(async () => {
+    console.trace('stopRingDataCollection() called');
     if (!deviceId || !isCollecting) return;
 
     try {
@@ -370,11 +371,13 @@ export const useRingDataCollector = () => {
 
       // Stop notifications
       try {
+        await new Promise(r => setTimeout(r, 300));
         await BluetoothLe.stopNotifications({ deviceId, service: RXTX_SERVICE_UUID, characteristic: RXTX_NOTIFY_UUID });
       } catch (e) {
         console.warn('stopNotifications RXTX failed:', e);
       }
       try {
+        await new Promise(r => setTimeout(r, 300));
         await BluetoothLe.stopNotifications({ deviceId, service: MAIN_SERVICE_UUID, characteristic: MAIN_NOTIFY_UUID });
       } catch (e) {
         console.warn('stopNotifications MAIN failed:', e);
@@ -434,7 +437,8 @@ export const useRingDataCollector = () => {
         stopDataCollection();
       }
     };
-  }, [deviceId, isCollecting, stopDataCollection]);
+  // }, [deviceId, isCollecting, stopDataCollection]);
+  }, [deviceId, isCollecting]);
 
   return {
     initialize,
