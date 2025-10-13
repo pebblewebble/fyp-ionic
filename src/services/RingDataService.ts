@@ -157,7 +157,14 @@ export const useRingDataCollector = () => {
   const [data, setData] = useState<any[]>([]);
   const [isCollecting, setIsCollecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
+  // Batching config
+  const UPLOAD_BATCH_SIZE = 50;
+  // using this for testing first
+  const API_BASE = "http://192.168.1.9:8000";
+  const API_TOKEN = "";
+  const uploadBufferRef = useRef<any[]>([]);
+  const isUploadingRef = useRef(false);
+  
   // Keep listener handles so we can remove them on stop/unmount
   const rxtxListenerRef = useRef<any>(null);
   const mainListenerRef = useRef<any>(null);
@@ -225,6 +232,65 @@ export const useRingDataCollector = () => {
     }
   }, []);
 
+  const sendBatchToServer = async(deviceIdForBatch: string | null, labelForBatch: string | null, records: any[])=>{
+    if (!records || records.length === 0) return true;
+    const payload = {
+      device_id: deviceIdForBatch ?? deviceId ?? 'unknown',
+      // label: labelForBatch ?? (records[0]?.label ?? null),
+      records: records.map(r => ({
+        timestamp: new Date(r.timestamp).toISOString(),
+        label: r.label,
+        payload: r.payload,
+        accX: r.accX ?? null,
+        accY: r.accY ?? null,
+        accZ: r.accZ ?? null,
+        ppg: r.ppg ?? null,
+        spo2: r.spo2 ?? null,
+        meta: r.meta ?? null
+      }))
+    };
+
+    try{
+      const res = await fetch(`${API_BASE}/api/v1/data`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${API_TOKEN}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(()=>'<no body>');
+        console.warn('Batch upload server error', res.status, txt);
+        return false;
+      }
+      console.log('Batch uploaded:', records.length);
+      return true;
+    }catch(e){
+      console.warn("Batch upload failed bruh:",e);
+      return false;
+    }
+  }
+
+  const enqueueRecord = (entry: any) => {
+    uploadBufferRef.current.push(entry);
+  };
+
+  const flushIfNeeded = async () => {
+    if (isUploadingRef.current) return;
+    if (uploadBufferRef.current.length >= UPLOAD_BATCH_SIZE) {
+      isUploadingRef.current = true;
+      const chunk = uploadBufferRef.current.splice(0, UPLOAD_BATCH_SIZE);
+      const success = await sendBatchToServer(deviceId ?? null, chunk[0]?.label ?? null, chunk);
+      if (!success) {
+        // Put failed chunk back to the front
+        uploadBufferRef.current = chunk.concat(uploadBufferRef.current);
+        console.warn('Requeued chunk after failed upload, buffer length:', uploadBufferRef.current.length);
+      }
+      isUploadingRef.current = false;
+    }
+  };
+
   const handleNotification = (dataView: DataView, label: string) => {
     const bytes = new Uint8Array(dataView.buffer);
     console.log('handleNotification raw bytes:', Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join(' '));
@@ -281,6 +347,13 @@ export const useRingDataCollector = () => {
       setData(prev => {
         const next = [...prev, newEntry];
         console.log('Appending entry -> new length:', next.length);
+
+        // enqueue for upload
+        enqueueRecord(newEntry);
+
+        // trigger flush-if-needed (fire-and-forget; helper blocks concurrent uploads)
+        flushIfNeeded().catch(err => console.error('flushIfNeeded error', err));
+
         return next;
       });
 
@@ -368,6 +441,21 @@ export const useRingDataCollector = () => {
     try {
       // Send disable command
       await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, DISABLE_RAW_SENSOR_CMD);
+
+      if (uploadBufferRef.current.length > 0) {
+        console.log('Flushing remaining', uploadBufferRef.current.length, 'records before stop');
+        // send in chunks until buffer empty or a chunk fails (then we requeue and break)
+        while (uploadBufferRef.current.length > 0) {
+          const chunk = uploadBufferRef.current.splice(0, UPLOAD_BATCH_SIZE);
+          const ok = await sendBatchToServer(deviceId ?? null, chunk[0]?.label ?? null, chunk);
+          if (!ok) {
+            // requeue and break; remaining data will be saved locally or retried next run
+            uploadBufferRef.current = chunk.concat(uploadBufferRef.current);
+            console.warn('Final flush failed, requeued', uploadBufferRef.current.length);
+            break;
+          }
+        }
+      }
 
       // Stop notifications
       try {
