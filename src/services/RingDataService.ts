@@ -169,6 +169,9 @@ export const useRingDataCollector = () => {
   const rxtxListenerRef = useRef<any>(null);
   const mainListenerRef = useRef<any>(null);
 
+  // There seems to be multiple listener in one session
+  const listenersAddedRef = useRef(false);
+
   const initialize = useCallback(async () => {
     try {
       await BluetoothLe.initialize({ androidNeverForLocation: true });
@@ -291,7 +294,7 @@ export const useRingDataCollector = () => {
     }
   };
 
-  const handleNotification = (dataView: DataView, label: string) => {
+  const handleNotification = (dataView: DataView, label: String) => {
     const bytes = new Uint8Array(dataView.buffer);
     console.log('handleNotification raw bytes:', Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join(' '));
 
@@ -343,17 +346,11 @@ export const useRingDataCollector = () => {
       // temporarily comment out skip to see everything for debugging
       // if (newEntry.ppg === 0 || newEntry.spo2 === 0) { console.log('Skipping zero values'); return; }
 
-      // Append to state
       setData(prev => {
         const next = [...prev, newEntry];
         console.log('Appending entry -> new length:', next.length);
-
-        // enqueue for upload
-        enqueueRecord(newEntry);
-
-        // trigger flush-if-needed (fire-and-forget; helper blocks concurrent uploads)
-        flushIfNeeded().catch(err => console.error('flushIfNeeded error', err));
-
+        enqueueRecord(newEntry);         
+        flushIfNeeded().catch(console.error);
         return next;
       });
 
@@ -381,29 +378,40 @@ export const useRingDataCollector = () => {
 
         // Set up notification listeners BEFORE starting notifications
         const rxtxListenerKey = `notification|${deviceId}|${RXTX_SERVICE_UUID}|${RXTX_NOTIFY_UUID}`;
-        rxtxListenerRef.current = await BluetoothLe.addListener(rxtxListenerKey, (result: any) => {
-          if (!result?.value) {
-            console.info('Received notification with undefined value (RXTX)');
-            return;
-          }
 
-          // inside the addListener callback (both RXTX and MAIN)
-          console.info('RAW notification result.value:', result.value, 'typeof:', typeof result.value);
+        console.log('Adding listeners? alreadyAdded =', listenersAddedRef.current);
 
-          const dataView = normalizeResultValueToDataView(result.value);
-          console.info('Normalized DataView byteLength=', dataView.byteLength);
-          handleNotification(dataView, label);
-        });
+        if(!listenersAddedRef.current){
+          listenersAddedRef.current = true;
 
-        const mainListenerKey = `notification|${deviceId}|${MAIN_SERVICE_UUID}|${MAIN_NOTIFY_UUID}`;
-        mainListenerRef.current = await BluetoothLe.addListener(mainListenerKey, (result: any) => {
-          if (!result?.value) {
-            console.info('Received notification with undefined value (MAIN)');
-            return;
-          }
-          const dataView = normalizeResultValueToDataView(result.value);
-          handleNotification(dataView, label);
-        });
+          rxtxListenerRef.current = await BluetoothLe.addListener(rxtxListenerKey, (result: any) => {
+            if (!result?.value) {
+              console.info('Received notification with undefined value (RXTX)');
+              return;
+            }
+
+            // inside the addListener callback (both RXTX and MAIN)
+            console.info('RAW notification result.value:', result.value, 'typeof:', typeof result.value);
+
+            const dataView = normalizeResultValueToDataView(result.value);
+            console.info('Normalized DataView byteLength=', dataView.byteLength);
+            handleNotification(dataView, label);
+          });
+
+          const mainListenerKey = `notification|${deviceId}|${MAIN_SERVICE_UUID}|${MAIN_NOTIFY_UUID}`;
+          mainListenerRef.current = await BluetoothLe.addListener(mainListenerKey, (result: any) => {
+            if (!result?.value) {
+              console.info('Received notification with undefined value (MAIN)');
+              return;
+            }
+            const dataView = normalizeResultValueToDataView(result.value);
+            handleNotification(dataView, label);
+          });
+        }else{
+          console.log('Listeners alrerady added.');
+        }
+
+        
 
         // Start notifications (only after listeners registered
         console.info('Starting notifications...');
@@ -482,6 +490,11 @@ export const useRingDataCollector = () => {
       } catch (e) {
         console.warn('Failed to remove main listener:', e);
       }
+
+      // reset guard so next start can re-register listeners
+      listenersAddedRef.current = false;
+      rxtxListenerRef.current = null;
+      mainListenerRef.current = null;
 
       await saveToCsv();
       try {

@@ -1,11 +1,14 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
+import { RingDataProvider } from './services/RingDataProvider';
 
 const container = document.getElementById('root');
 const root = createRoot(container!);
 root.render(
-  <React.StrictMode>
+  // <React.StrictMode>
+  <RingDataProvider>
     <App />
-  </React.StrictMode>
+  </RingDataProvider>
+  // </React.StrictMode>
 );

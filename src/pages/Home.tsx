@@ -2,8 +2,10 @@ import { IonPage, IonHeader, IonToolbar, IonTitle, IonContent, IonButton, IonLis
 import { useRingDataCollector } from '../services/RingDataService';
 import './Home.css';
 import { useEffect } from 'react';
+import { useRingData } from '../services/RingDataProvider';
 
 const Home: React.FC = () => {
+  console.trace('Component Home mounted; calling useRingDataData');
   const { 
     initialize, 
     scanAndConnect, 
@@ -13,7 +15,7 @@ const Home: React.FC = () => {
     data, 
     error,
     deviceId  // Add this to destructuring
-  } = useRingDataCollector();
+  } = useRingData();
 
   // Initialize on mount
   useEffect(() => {
