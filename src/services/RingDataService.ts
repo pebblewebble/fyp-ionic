@@ -2,6 +2,12 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { BluetoothLe, BleClient } from '@capacitor-community/bluetooth-le';
 import Papa from 'papaparse';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
+import { Capacitor } from '@capacitor/core';
+import{
+  ForegroundService,
+  ServiceType,
+  Importance
+} from '@capawesome-team/capacitor-android-foreground-service';
 
 // RXTX Service (used for commands)
 const RXTX_SERVICE_UUID = '6e40fff0-b5a3-f393-e0a9-e50e24dcca9e';
@@ -149,6 +155,54 @@ const writeCommand = async (
   } catch (e) {
     console.error('All write attempts failed:', e);
     throw e;
+  }
+};
+
+const ensureForegroundServiceStarted = async (opts?: {
+  id?: number;
+  title?: string;
+  body?: string;
+  smallIcon?: string;
+  notificationChannelId?: string;
+}) => {
+  if (Capacitor.getPlatform() !== 'android') return;
+
+  try {
+    // create notification channel (id must match update/start calls)
+    await ForegroundService.createNotificationChannel({
+      id: opts?.notificationChannelId ?? 'default',
+      name: 'Background collection',
+      description: 'Collecting BLE data in the background',
+      importance: Importance.Default,
+    });
+
+    // start the foreground service with a small notification + optional serviceType
+    await ForegroundService.startForegroundService({
+      id: opts?.id ?? 1,
+      title: opts?.title ?? 'Ring data collection',
+      body: opts?.body ?? 'Collecting data in background',
+      smallIcon: opts?.smallIcon ?? 'ic_stat_icon_config_sample',
+      notificationChannelId: opts?.notificationChannelId ?? 'default',
+
+      // prefer a connectedDevice type for BLE; plugin exposes ServiceType enum.
+      // If your plugin version doesn't support ServiceType.ConnectedDevice,
+      // remove this line or pick the closest available ServiceType.
+      // serviceType: (ServiceType as any)?.ConnectedDevice ?? (ServiceType as any)?.connectedDevice,
+    });
+    console.info('[ForegroundService] started');
+  } catch (e) {
+    console.warn('[ForegroundService] failed to start', e);
+  }
+};
+
+// Stop foreground service 
+const ensureForegroundServiceStopped = async () => {
+  if (Capacitor.getPlatform() !== 'android') return;
+  try {
+    await ForegroundService.stopForegroundService();
+    console.info('[ForegroundService] stopped');
+  } catch (e) {
+    console.warn('[ForegroundService] failed to stop', e);
   }
 };
 
@@ -365,6 +419,15 @@ export const useRingDataCollector = () => {
     async (durationSeconds: number = 60, label: string = 'default') => {
       if (!deviceId || isCollecting) return;
 
+      // Start foreground service first (Android) so system keeps process alive
+      await ensureForegroundServiceStarted({
+        id: 1001,
+        title: 'Ring collector',
+        body: 'Collecting BLE data in background',
+        smallIcon: 'ic_stat_icon_config_sample',
+        notificationChannelId: 'ring-collector',
+      });
+
       setIsCollecting(true);
       setError(null);
       setData([]);
@@ -437,6 +500,8 @@ export const useRingDataCollector = () => {
         setError(`Start error: ${String(err)}`);
         setIsCollecting(false);
         console.error('Full error:', err);
+        // Stop the foreground service if BLE setup failed
+        await ensureForegroundServiceStopped();
       }
     },
     [deviceId, isCollecting]
@@ -510,6 +575,9 @@ export const useRingDataCollector = () => {
       setError(`Stop error: ${String(err)}`);
       setIsCollecting(false);
       console.error('Stop error full:', err);
+    } finally{
+      // always stop the native foreground service as well
+      await ensureForegroundServiceStopped();
     }
   }, [deviceId, isCollecting, data]);
 
