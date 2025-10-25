@@ -226,6 +226,20 @@ export const useRingDataCollector = () => {
   // There seems to be multiple listener in one session
   const listenersAddedRef = useRef(false);
 
+  const periodicTimerRef = useRef<number | null>(null); // window.setInterval id
+  const periodicRunningRef = useRef(false); // is periodic scheduler active
+
+  const collectionTimeoutRef = useRef<number | null>(null);
+
+  // mirror React state to refs to avoid stale closures
+  const isCollectingRef = useRef<boolean>(isCollecting);
+  useEffect(() => { isCollectingRef.current = isCollecting; }, [isCollecting]);
+
+  const deviceIdRef = useRef<string | null>(deviceId);
+  useEffect(() => { deviceIdRef.current = deviceId; }, [deviceId]);
+
+  const isDeviceConnectedRef = useRef(false);
+
   const initialize = useCallback(async () => {
     try {
       await BluetoothLe.initialize({ androidNeverForLocation: true });
@@ -274,11 +288,13 @@ export const useRingDataCollector = () => {
       BluetoothLe.addListener('onDisconnect', (info: any) => {
         if (info?.deviceId === ring.deviceId) {
           console.info('Device disconnected:', info.deviceId);
+          isDeviceConnectedRef.current = false;
           setIsCollecting(false);
           setDeviceId(null);
         }
       });
 
+      isDeviceConnectedRef.current = true;
       // only now mark device as connected in state
       setDeviceId(ring.deviceId);
       console.info('Connected successfully!');
@@ -419,6 +435,11 @@ export const useRingDataCollector = () => {
     async (durationSeconds: number = 60, label: string = 'default') => {
       if (!deviceId || isCollecting) return;
 
+      if (!isDeviceConnectedRef.current) {
+        setError('Device not connected');
+        return;
+      }
+
       // Start foreground service first (Android) so system keeps process alive
       await ensureForegroundServiceStarted({
         id: 1001,
@@ -494,8 +515,19 @@ export const useRingDataCollector = () => {
         await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, ENABLE_RAW_SENSOR_CMD);
         console.info('Commands sent');
 
-        // Auto-stop after duration
-        setTimeout(() => stopDataCollection(), durationSeconds * 1000);
+        // Auto-stop after duration (store timer so we can cancel if needed)
+        if (collectionTimeoutRef.current) {
+          clearTimeout(collectionTimeoutRef.current);
+          collectionTimeoutRef.current = null;
+        }
+
+        collectionTimeoutRef.current = window.setTimeout(() => {
+          // clear ref immediately to avoid double-clear races
+          collectionTimeoutRef.current = null;
+          stopDataCollection().catch((err) => {
+            console.error('Error stopping collection from timeout', err);
+          });
+        }, Math.max(0, durationSeconds) * 1000);
       } catch (err) {
         setError(`Start error: ${String(err)}`);
         setIsCollecting(false);
@@ -509,65 +541,53 @@ export const useRingDataCollector = () => {
 
   const stopDataCollection = useCallback(async () => {
     console.trace('stopRingDataCollection() called');
-    if (!deviceId || !isCollecting) return;
+
+    // prevent duplicate calls from racing
+    // clear any scheduled auto-stop (we're handling stop now)
+    if (collectionTimeoutRef.current) {
+      clearTimeout(collectionTimeoutRef.current);
+      collectionTimeoutRef.current = null;
+    }
 
     try {
-      // Send disable command
-      await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, DISABLE_RAW_SENSOR_CMD);
+      // Send disable command only if there is an active deviceId
+      if (deviceId && isDeviceConnectedRef.current) {
+        try {
+          await writeCommand(deviceId, RXTX_SERVICE_UUID, RXTX_WRITE_UUID, DISABLE_RAW_SENSOR_CMD);
+        } catch (e) {
+          console.warn('Failed to write disable command (device may be disconnected):', e);
+        }
+      } else {
+        console.info('No deviceId when stopping or the device is not connected — skipping disable command.');
+      }
 
       if (uploadBufferRef.current.length > 0) {
         console.log('Flushing remaining', uploadBufferRef.current.length, 'records before stop');
-        // send in chunks until buffer empty or a chunk fails (then we requeue and break)
         while (uploadBufferRef.current.length > 0) {
           const chunk = uploadBufferRef.current.splice(0, UPLOAD_BATCH_SIZE);
           const ok = await sendBatchToServer(deviceId ?? null, chunk[0]?.label ?? null, chunk);
           if (!ok) {
-            // requeue and break; remaining data will be saved locally or retried next run
-            uploadBufferRef.current = chunk.concat(uploadBufferRef.current);
-            console.warn('Final flush failed, requeued', uploadBufferRef.current.length);
+            // push the chunk back and break; we don't want infinite loop
+            uploadBufferRef.current.unshift(...chunk);
+            console.warn('Upload chunk failed while stopping; requeued chunk');
             break;
           }
         }
       }
 
-      // Stop notifications
-      try {
-        await new Promise(r => setTimeout(r, 300));
-        await BluetoothLe.stopNotifications({ deviceId, service: RXTX_SERVICE_UUID, characteristic: RXTX_NOTIFY_UUID });
-      } catch (e) {
-        console.warn('stopNotifications RXTX failed:', e);
-      }
-      try {
-        await new Promise(r => setTimeout(r, 300));
-        await BluetoothLe.stopNotifications({ deviceId, service: MAIN_SERVICE_UUID, characteristic: MAIN_NOTIFY_UUID });
-      } catch (e) {
-        console.warn('stopNotifications MAIN failed:', e);
-      }
-
-      // Remove listeners if present
-      try {
-        if (rxtxListenerRef.current?.remove) await rxtxListenerRef.current.remove();
-      } catch (e) {
-        console.warn('Failed to remove rxtx listener:', e);
-      }
-      try {
-        if (mainListenerRef.current?.remove) await mainListenerRef.current.remove();
-      } catch (e) {
-        console.warn('Failed to remove main listener:', e);
-      }
-
-      // reset guard so next start can re-register listeners
-      listenersAddedRef.current = false;
-      rxtxListenerRef.current = null;
-      mainListenerRef.current = null;
-
       await saveToCsv();
-      try {
-        await BluetoothLe.disconnect({ deviceId });
-      } catch (e) {
-        console.warn('Disconnect failed or already disconnected:', e);
+
+      // Attempt to disconnect
+      if (deviceId && isDeviceConnectedRef.current) {
+        try {
+          await BluetoothLe.disconnect({ deviceId });
+          isDeviceConnectedRef.current = false;
+        } catch (e) {
+          console.warn('Disconnect failed:', e);
+        }
       }
 
+      // Clear internal state
       setDeviceId(null);
       setIsCollecting(false);
       console.info('Stopped and disconnected');
@@ -575,11 +595,15 @@ export const useRingDataCollector = () => {
       setError(`Stop error: ${String(err)}`);
       setIsCollecting(false);
       console.error('Stop error full:', err);
-    } finally{
+    } finally {
       // always stop the native foreground service as well
-      await ensureForegroundServiceStopped();
+      try {
+        await ensureForegroundServiceStopped();
+      } catch (e) {
+        console.warn('ensureForegroundServiceStopped failed in finally:', e);
+      }
     }
-  }, [deviceId, isCollecting, data]);
+  }, [deviceId, data]);
 
   const saveToCsv = async () => {
     const csv = Papa.unparse(data);
@@ -600,20 +624,109 @@ export const useRingDataCollector = () => {
     }
   };
 
+  const startPeriodicCollection = useCallback(
+    async (periodMinutes: number = 5, sampleSeconds: number = 10, label: string = 'periodic', autoConnect: boolean = false) => {
+      if (periodicRunningRef.current) {
+        console.info('Periodic collection already running');
+        return;
+      }
+      periodicRunningRef.current = true;
+
+      // optionally ensure we are connected before starting the first sample
+      if (!deviceId && autoConnect) {
+        try {
+          await scanAndConnect();
+          // small delay to let connection settle
+          await new Promise((r) => setTimeout(r, 500));
+        } catch (e) {
+          console.warn('Auto connect failed; periodic samples may be skipped until a device is connected.', e);
+        }
+      }
+
+      const startSample = async () => {
+        if (!deviceId) {
+          console.warn('No device connected — skipping periodic sample');
+          return;
+        }
+        if (isCollecting) {
+          console.warn('Collection already in progress — skipping this periodic tick');
+          return;
+        }
+        try {
+          console.info(`Periodic: starting sample for ${sampleSeconds}s (label=${label})`);
+          await startDataCollection(sampleSeconds, label);
+        } catch (e) {
+          console.error('Periodic: failed to start sample:', e);
+        }
+      };
+
+      // start an immediate sample, then schedule the interval
+      startSample().catch(console.error);
+
+      const periodMs = Math.max(1000, Math.floor(periodMinutes * 60 * 1000));
+      periodicTimerRef.current = window.setInterval(() => {
+        startSample().catch(console.error);
+      }, periodMs) as unknown as number;
+
+      console.info('Periodic collection started. periodMinutes=', periodMinutes, 'sampleSeconds=', sampleSeconds);
+    },
+    // dependencies: functions/values referenced
+    [deviceId, isCollecting, scanAndConnect, startDataCollection]
+  );
+
+  const stopPeriodicCollection = useCallback(async () => {
+    if (!periodicRunningRef.current && !periodicTimerRef.current) {
+      console.info('Periodic collection not running');
+      return;
+    }
+    periodicRunningRef.current = false;
+    if (periodicTimerRef.current !== null) {
+      clearInterval(periodicTimerRef.current);
+      periodicTimerRef.current = null;
+    }
+    console.info('Periodic collection stopped');
+  }, []);
+
   useEffect(() => {
+    // Only cleanup on actual unmount, not on state changes
     return () => {
-      if (deviceId && isCollecting) {
-        stopDataCollection();
+      console.log('Component unmounting - cleaning up');
+      
+      // Stop periodic collection synchronously
+      if (periodicTimerRef.current !== null) {
+        clearInterval(periodicTimerRef.current);
+        periodicTimerRef.current = null;
+      }
+      periodicRunningRef.current = false;
+
+      // Stop collection timeout
+      if (collectionTimeoutRef.current) {
+        clearTimeout(collectionTimeoutRef.current);
+        collectionTimeoutRef.current = null;
+      }
+
+      // Disconnect device if still connected (async but don't await)
+      if (deviceIdRef.current && isDeviceConnectedRef.current) {
+        (async () => {
+          try {
+            await BluetoothLe.disconnect({ deviceId: deviceIdRef.current! });
+            await ensureForegroundServiceStopped();
+            console.log('Cleanup: disconnected device');
+          } catch (e) {
+            console.warn('Cleanup disconnect failed:', e);
+          }
+        })();
       }
     };
-  // }, [deviceId, isCollecting, stopDataCollection]);
-  }, [deviceId, isCollecting]);
+  }, []);
 
   return {
     initialize,
     scanAndConnect,
     startDataCollection,
     stopDataCollection,
+    startPeriodicCollection,
+    stopPeriodicCollection,
     isCollecting,
     data,
     error,
