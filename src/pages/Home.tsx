@@ -11,6 +11,7 @@ const Home: React.FC = () => {
     scanAndConnect, 
     startDataCollection, 
     stopDataCollection, 
+    disconnectDevice,
     startPeriodicCollection,
     stopPeriodicCollection,
     isCollecting, 
@@ -49,7 +50,7 @@ const Home: React.FC = () => {
         </IonButton>
 
         <IonButton 
-          onClick={() => startPeriodicCollection(5,20, 'walking',false)} 
+          onClick={() => startPeriodicCollection(1,10, 'walking',false)} 
           disabled={!deviceId || isCollecting}
           expand="block"
         >
