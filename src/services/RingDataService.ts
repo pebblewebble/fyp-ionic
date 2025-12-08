@@ -18,6 +18,27 @@ const RXTX_NOTIFY_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const MAIN_SERVICE_UUID = 'de5bf728-d711-4e47-af26-65e3012a5dc7';
 const MAIN_NOTIFY_UUID = 'de5bf729-d711-4e47-af26-65e3012a5dc7';
 
+const MERGE_WINDOW_MS = 150; 
+
+interface RingRecord {
+  timestamp: number;
+  label: string;
+  payload: string; // Combined hex payload
+  // Sensor Data
+  accX: number | null;
+  accY: number | null;
+  accZ: number | null;
+  ppg: number | null;
+  ppg_max: number | null;
+  ppg_min: number | null;
+  ppg_diff: number | null;
+  spo2: number | null;
+  spo2_max: number | null;
+  spo2_min: number | null;
+  spo2_diff: number | null;
+  meta: any | null;
+}
+
 const isLikelyHexString = (s: string) => /^[0-9a-fA-F]+$/.test(s) && (s.length % 2 === 0);
 
 const normalizeResultValueToDataView = (value: any): DataView => {
@@ -218,6 +239,8 @@ export const useRingDataCollector = () => {
   const API_TOKEN = "";
   const uploadBufferRef = useRef<any[]>([]);
   const isUploadingRef = useRef(false);
+
+  const pendingRecordRef = useRef<RingRecord | null>(null);
   
   // Keep listener handles so we can remove them on stop/unmount
   const rxtxListenerRef = useRef<any>(null);
@@ -266,8 +289,8 @@ export const useRingDataCollector = () => {
       });
 
       await BluetoothLe.requestLEScan({ allowDuplicates: false, scanMode: 2 });
-      console.info('Scanning for 10 seconds...');
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+      console.info('Scanning for 5 seconds...');
+      await new Promise((resolve) => setTimeout(resolve, 5000));
       await BluetoothLe.stopLEScan();
       console.info('Scan stopped. Found devices:', scanResults);
 
@@ -310,7 +333,6 @@ export const useRingDataCollector = () => {
     if (!records || records.length === 0) return true;
     const payload = {
       device_id: deviceIdForBatch ?? deviceId ?? 'unknown',
-      // label: labelForBatch ?? (records[0]?.label ?? null),
       records: records.map(r => ({
         timestamp: new Date(r.timestamp).toISOString(),
         label: r.label,
@@ -319,7 +341,13 @@ export const useRingDataCollector = () => {
         accY: r.accY ?? null,
         accZ: r.accZ ?? null,
         ppg: r.ppg ?? null,
+        ppg_max: r.ppg_max ?? null,
+        ppg_min: r.ppg_min ?? null,
+        ppg_diff: r.ppg_diff,
         spo2: r.spo2 ?? null,
+        spo2_max: r.spo2_max ?? null,
+        spo2_min: r.spo2_min ?? null,
+        spo2_diff: r.spo2_diff ?? null,
         meta: r.meta ?? null
       }))
     };
@@ -348,6 +376,11 @@ export const useRingDataCollector = () => {
 
   const enqueueRecord = (entry: any) => {
     uploadBufferRef.current.push(entry);
+    setData(prev => {
+      const next = [...prev, entry];
+      if(next.length > 10) return next.slice(next.length - 10);
+      return next;
+    });
   };
 
   const flushIfNeeded = async () => {
@@ -365,68 +398,91 @@ export const useRingDataCollector = () => {
     }
   };
 
-  const handleNotification = (dataView: DataView, label: String) => {
-    const bytes = new Uint8Array(dataView.buffer);
-    console.log('handleNotification raw bytes:', Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join(' '));
+  const commitRecord = (record: RingRecord) => {
+    enqueueRecord(record);
+    flushIfNeeded().catch(console.error);
+  };
 
-    const timestamp = Date.now();
-    const newEntry: any = {
+  const createEmptyRecord = (timestamp: number, label: string): RingRecord => {
+    return {
       timestamp,
       label,
-      payload: Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(''),
+      payload: '',
       accX: null, accY: null, accZ: null,
       ppg: null, ppg_max: null, ppg_min: null, ppg_diff: null,
-      spo2: null, spo2_max: null, spo2_min: null, spo2_diff: null
+      spo2: null, spo2_max: null, spo2_min: null, spo2_diff: null,
+      meta: null
     };
+  };
 
-    if (bytes.length === 0) {
-      console.warn('Empty notification bytes — ignoring');
-      return;
-    }
+  const handleNotification = (dataView: DataView, label: string) => {
+    const bytes = new Uint8Array(dataView.buffer);
+    if (bytes.length === 0) return;
 
+    const now = Date.now();
+
+    // Only process sensor packets (0xA1)
     if (bytes[0] === 0xA1) {
-      const subtype = bytes[1];
+      const subtype = bytes[1]; // 0x01=SpO2, 0x02=PPG, 0x03=Accel
+
+      let current = pendingRecordRef.current;
+
+      // Logic to decide if we should flush the current record and start a new one:
+      // 1. No record exists.
+      // 2. The time gap between now and the record start is too large.
+      // 3. The current record ALREADY has data for this subtype (data collision).
+      
+      const isTimeGap = current && (now - current.timestamp > MERGE_WINDOW_MS);
+      let isDuplicateType = false;
+
+      if (current) {
+        if (subtype === 0x01 && current.spo2 !== null) isDuplicateType = true;
+        if (subtype === 0x02 && current.ppg !== null) isDuplicateType = true;
+        if (subtype === 0x03 && current.accX !== null) isDuplicateType = true;
+      }
+
+      if (!current || isTimeGap || isDuplicateType) {
+        // If there was an old record pending, save it now
+        if (current) {
+          commitRecord(current);
+        }
+        // Start a new record
+        current = createEmptyRecord(now, label);
+        pendingRecordRef.current = current;
+      }
+
+      // --- Append Payload (Optional debug info) ---
+      const hexPayload = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      current.payload += (current.payload ? '|' : '') + hexPayload;
+
+      // --- Merge Data fields ---
       if (subtype === 0x01) { // SpO2
-        newEntry.spo2 = (bytes[2] << 8) | bytes[3];
-        newEntry.spo2_max = bytes[5];
-        newEntry.spo2_min = bytes[7];
-        newEntry.spo2_diff = bytes[9];
+        current.spo2 = (bytes[2] << 8) | bytes[3];
+        current.spo2_max = bytes[5];
+        current.spo2_min = bytes[7];
+        current.spo2_diff = bytes[9];
       } else if (subtype === 0x02) { // PPG
-        newEntry.ppg = (bytes[2] << 8) | bytes[3];
-        newEntry.ppg_max = (bytes[4] << 8) | bytes[5];
-        newEntry.ppg_min = (bytes[6] << 8) | bytes[7];
-        newEntry.ppg_diff = (bytes[8] << 8) | bytes[9];
+        current.ppg = (bytes[2] << 8) | bytes[3];
+        current.ppg_max = (bytes[4] << 8) | bytes[5];
+        current.ppg_min = (bytes[6] << 8) | bytes[7];
+        current.ppg_diff = (bytes[8] << 8) | bytes[9];
       } else if (subtype === 0x03) { // Accel
         let valX = ((bytes[6] << 4) | (bytes[7] & 0x0f));
         if (valX & 0x0800) valX -= 0x1000;
-        newEntry.accX = valX;
+        current.accX = valX;
 
         let valY = ((bytes[2] << 4) | (bytes[3] & 0x0f));
         if (valY & 0x0800) valY -= 0x1000;
-        newEntry.accY = valY;
+        current.accY = valY;
 
         let valZ = ((bytes[4] << 4) | (bytes[5] & 0x0f));
         if (valZ & 0x0800) valZ -= 0x1000;
-        newEntry.accZ = valZ;
-      } else {
-        console.log('Unknown subtype', subtype);
+        current.accZ = valZ;
       }
+      
+      // Note: We do NOT commit here. We wait for the next packet or stop command to commit.
+      // This allows SpO2, PPG, and Accel arriving within 150ms to populate the same object.
 
-      console.log('Parsed entry (pre-skip):', newEntry);
-
-      // temporarily comment out skip to see everything for debugging
-      // if (newEntry.ppg === 0 || newEntry.spo2 === 0) { console.log('Skipping zero values'); return; }
-
-      setData(prev => {
-        const next = [...prev, newEntry];
-        console.log('Appending entry -> new length:', next.length);
-        enqueueRecord(newEntry);         
-        flushIfNeeded().catch(console.error);
-        return next;
-      });
-
-      // Optionally show the last entry quickly in console
-      // console.log('Latest entry:', newEntry);
     } else {
       console.warn('Unknown packet header:', bytes[0]);
     }
@@ -455,6 +511,7 @@ export const useRingDataCollector = () => {
       setIsCollecting(true);
       setError(null);
       setData([]);
+      pendingRecordRef.current = null;
 
       try {
         // small delay after connect to allow discovery to complete on some Android devices
@@ -562,6 +619,11 @@ export const useRingDataCollector = () => {
         }
       } else {
         console.info('No deviceId when stopping or the device is not connected — skipping disable command.');
+      }
+
+      if (pendingRecordRef.current) {
+        commitRecord(pendingRecordRef.current);
+        pendingRecordRef.current = null;
       }
 
       if (uploadBufferRef.current.length > 0) {

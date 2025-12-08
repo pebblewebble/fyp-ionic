@@ -1,0 +1,193 @@
+:root {
+  --app-bg: #121212;
+  --card-bg: #1E1E1E;
+  --card-bg-hover: #252525;
+  --accent-teal: #1DB954; 
+  --text-muted: #B3B3B3;
+  --text-bright: #FFFFFF;
+}
+
+ion-content {
+  --background: var(--app-bg);
+}
+
+/* --- DNA: Airbnb Spacing & Card System --- */
+.biometric-card {
+  background: var(--card-bg);
+  border-radius: 16px;
+  margin: 16px 0;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4); 
+    animation: feedEnter 0.6s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+overflow: hidden; 
+will-change: max-height, transform, opacity, margin;
+}
+
+/* --- Control Center (Buttons) --- */
+.control-panel {
+  background: #1E1E1E; 
+  color: #FFFFFF;
+  border: 1px solid rgba(255, 255, 255, 0.1); 
+  padding: 16px;
+  border-radius: 16px;
+  margin-bottom: 20px;
+}
+
+.status-badge {
+  background: rgba(255,255,255,0.1);
+  color: var(--text-muted);
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  display: inline-block;
+  margin-right: 8px;
+  margin-bottom: 8px;
+}
+
+.status-badge.active {
+  background: rgba(29, 185, 84, 0.2);
+  color: var(--accent-teal);
+  border: 1px solid var(--accent-teal);
+  animation: activePulse 2s infinite;
+  border-color: var(--accent-teal);
+  color: var(--accent-teal);
+}
+
+/* --- Wellness Mode (Headspace Vibe) --- */
+.hero-section {
+  display: flex;
+  align-items: center;
+  padding: 20px;
+}
+
+.hero-icon {
+  display: flex;
+  align-items: center;      
+  justify-content: center;  
+
+  width: 54px;   
+  height: 54px;  
+  border-radius: 50%;
+
+  background: rgba(29, 185, 84, 0.1);
+  color: var(--accent-teal);
+  margin-right: 16px;
+  
+  font-size: 28px; 
+
+  animation: heartbeat 2s infinite ease-in-out; 
+  will-change: transform;
+}
+
+.hero-value {
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.hero-label {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.secondary-grid {
+  background: rgba(0,0,0,0.2);
+  padding: 12px;
+}
+
+/* --- Scientific Mode (Terminal Vibe) --- */
+.science-header {
+  background: #000;
+  padding: 8px 16px;
+  border-bottom: 1px solid #333;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.science-row {
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  color: var(--text-bright);
+  padding: 6px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  display: flex;
+  justify-content: space-between;
+}
+
+.science-label {
+  color: var(--accent-teal);
+}
+
+.hero-section, .science-header, .science-row, .secondary-grid {
+  animation: fadeIn .8s ease-in;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes activePulse {
+  0% { box-shadow: 0 0 0 0 rgba(29, 185, 84, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(29, 185, 84, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(29, 185, 84, 0); }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-15px) scale(0.95); /* Starts slightly above and smaller */
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1); /* Lands in place */
+  }
+}
+
+@keyframes heartbeat {
+  0% { transform: scale(1); opacity: 1; }
+  15% { transform: scale(1.15); opacity: 0.9; } /* The Beat */
+  30% { transform: scale(1); opacity: 1; }      /* The Rest */
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes feedEnter {
+  0% {
+    /* 1. Start invisible and taking up ZERO space */
+    opacity: 0;
+    max-height: 0;
+    margin-top: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    
+    /* 2. Start position: floating above */
+    transform: translateY(-50px) scale(0.9);
+    
+    /* 3. Hide shadow so it doesn't flicker */
+    box-shadow: none;
+  }
+  
+  50% {
+    /* 4. Midway: The space opens up (pushes neighbors down) */
+    opacity: 0.5;
+    max-height: 200px; /* Approx height of your card */
+    margin-top: 16px;
+    margin-bottom: 16px;
+    padding-top: inherit; /* Restore padding */
+    
+    /* Still slightly above */
+    transform: translateY(-10px);
+  }
+
+  100% {
+    /* 5. End: Fully visible, locked in place */
+    opacity: 1;
+    max-height: 500px; /* Allow it to grow if needed */
+    transform: translateY(0) scale(1);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.4); 
+  }
+}
